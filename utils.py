@@ -1,8 +1,17 @@
 import glob
+import tqdm
+import time
 import torch
 import random
+import argparse
 import numpy as np
 import pandas as pd
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_style('darkgrid')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
 def data_list(path_to_data):
@@ -27,7 +36,7 @@ def data_list(path_to_data):
     # Train/val split
     train = df.loc[df['subset'] == 1]
     val = df.loc[df['subset'] == 0]
-    return train, val
+    return train.head(32), val.head(32)
 
 
 def read_off(file):
@@ -116,3 +125,127 @@ class PointCloudDataset(torch.utils.data.Dataset):
             pointcloud = self.transform(pointcloud)
         return pointcloud, torch.tensor(category)
     
+
+def init_weights(m):
+    try:
+        torch.nn.init.xavier_uniform_(m.weight)
+        m.bias.data.fill_(.01)
+    except Exception:
+        pass
+
+
+def train_model(
+        folder_to_save_weights,
+        path_to_train,
+        model,
+        train_dataloader,
+        valid_dataloader,
+        loss,
+        optimizer,
+        num_epoch,
+        scheduler=None,
+        avg_precision=True,
+):
+    """Model training function"""
+    train_loss_history, valid_loss_history = [], []
+    # Dataframe
+    df = pd.DataFrame()
+    # Model to device
+    model = model.to(device)
+    # Scaler for average precision training
+    scaler = torch.cuda.amp.GradScaler(enabled=avg_precision)
+    # Initial minimum loss
+    valid_min_loss = 1e10
+
+    for epoch in range(num_epoch):
+        # Each epoch has a training and validation phase
+        for phase in ['Train', 'Valid']:
+            if phase == 'Train':
+                dataloader = train_dataloader
+                model.train()  # Set model to training mode
+            else:
+                dataloader = valid_dataloader
+                model.eval()  # Set model to evaluate mode
+            running_loss = []
+            # Iterate over data.
+            with tqdm.tqdm(dataloader, unit='batch') as tqdm_loader:
+                for inputs, labels in tqdm_loader:
+                    tqdm_loader.set_description(f'Epoch {epoch}/{num_epoch-1} - {phase}')
+                    # Point Cloud and Label to device
+                    inputs = inputs.to(device, dtype=torch.half)
+                    labels = labels.to(device, dtype=torch.half)
+                    optimizer.zero_grad()
+                    # forward and backward
+                    with torch.set_grad_enabled(phase == 'Train'):
+                        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=avg_precision):
+                            predict, m3x3, m64x64 = model(inputs.transpose(1, 2))
+                            loss_value = loss(predict, labels, m3x3, m64x64)
+                        # backward + optimize only if in training phase
+                        if phase == 'Train':
+                            scaler.scale(loss_value).backward()
+                            scaler.step(optimizer)
+                            scaler.update()
+                            if scheduler is not None:
+                                scheduler.step()
+                    # statistics
+                    loss_item = loss_value.item()
+                    running_loss.append(loss_item)
+                    # Current statistics
+                    tqdm_loader.set_postfix(Loss=loss_item)
+                    time.sleep(.1)
+            epoch_loss = np.mean(running_loss)
+            # Checkpoint
+            if epoch_loss < valid_min_loss and phase != 'Train':
+                valid_min_loss = epoch_loss
+                model = model.cpu()
+                torch.save(model, f'{folder_to_save_weights}/best.pt')
+                model = model.to(device)
+            # Loss history
+            if phase == 'Train':
+                train_loss_history.append(epoch_loss)
+            else:
+                valid_loss_history.append(epoch_loss)
+            print(
+                'Epoch: {}/{}  Stage: {} Loss: {:.6f}'.format(
+                    epoch, num_epoch-1, phase, epoch_loss
+                ), flush=True
+            )
+            time.sleep(.1)
+
+    # Add results for each model
+    df['Train_Loss'] = train_loss_history
+    df['Valid_Loss'] = valid_loss_history
+    # Save df if csv format
+    df.to_csv(f'{path_to_train}/results.csv', sep=' ', index=False)
+    # Save last model
+    torch.save(model, f'{folder_to_save_weights}/last.pt')
+
+    return model, df
+
+
+def result_plot(data, path_to_train):
+    """Plot loss function and Metrics"""
+    stage_list = np.unique(list(map(lambda x: x.split(sep='_')[0], data.columns)))
+    variable_list = np.unique(list(map(lambda x: x.split(sep='_')[1], data.columns)))
+    plt.subplots(figsize=(10, 10))
+    for stage in stage_list:
+        for variable in variable_list:
+            plt.plot(data[f'{stage}_{variable}'], label=f'{stage}')
+            plt.title(f'{variable} Plot', fontsize=10)
+            plt.xlabel('Epoch', fontsize=8)
+            plt.ylabel(f'{variable} Value', fontsize=8)
+            plt.legend()
+    plt.savefig(f'{path_to_train}/loss_plot.png')
+
+
+def pointnetloss(outputs, labels, m3x3, m64x64, alpha = .0001):
+    criterion = torch.nn.NLLLoss()
+    bs=outputs.size(0)
+    id3x3 = torch.eye(3, requires_grad=True).repeat(bs, 1, 1)
+    id64x64 = torch.eye(64, requires_grad=True).repeat(bs, 1, 1)
+    if outputs.is_cuda:
+        id3x3=id3x3.cuda()
+        id64x64=id64x64.cuda()
+    diff3x3 = id3x3-torch.bmm(m3x3,m3x3.transpose(1, 2))
+    diff64x64 = id64x64-torch.bmm(m64x64,m64x64.transpose(1, 2))
+    return criterion(outputs, labels) + alpha * (torch.norm(diff3x3)+torch.norm(diff64x64)) / float(bs)
